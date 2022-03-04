@@ -1077,160 +1077,129 @@ write_doc_line :: proc(w: io.Writer, text: string) {
 }
 
 
-write_markup_text :: proc(w: io.Writer, s: string) {
-	s := s
-	n := strings.count(s, "`")
-	if n > 0 && n%2 == 0 {
-		for len(s) > 0 {
-			i := strings.index_byte(s, '`')
-			if i < 0 {
+write_markup_single_line :: proc(w: io.Writer, line: ^string) {
+	// Inline code
+	for {
+		backtick_index := strings.index_byte(line^, '`')
+		if backtick_index >= 0 {
+			io.write_string(w, line[:backtick_index])
+			line^ = line[backtick_index + 1:]
+
+			closing_backtick_index := strings.index_byte(line^, '`')
+			if closing_backtick_index >= 0 {
+				io.write_string(w, "<code>")
+				defer io.write_string(w, "</code>")
+				io.write_string(w, line[:closing_backtick_index])
+				line^ = line[closing_backtick_index + 1:]
+			} else {
 				break
 			}
-			io.write_string(w, s[:i])
-			s = s[i+1:]
-			io.write_string(w, "<code>")
-
-			i = strings.index_byte(s, '`'); assert(i >= 0)
-			io.write_string(w, s[:i])
-			s = s[i+1:]
-			io.write_string(w, "</code>")
+		} else {
+			break
 		}
-		io.write_string(w, s)
-	} else {
-		io.write_string(w, s)
 	}
+
+	// Normal text
+	io.write_string(w, line^)
+	io.write_string(w, " ")
+}
+
+write_markup_text :: proc(w: io.Writer, lines: []string) {
+	io.write_string(w, "<span style=\"white-space: pre-wrap\">") // Preserve leading whitespace
+	io.write_string(w, "<p>")
+	
+	line_loop: for i := 0; i < len(lines); i += 1 {
+		line := lines[i]
+		trimmed_line := strings.trim_space(line)
+
+		// Paragraph break
+		if len(trimmed_line) == 0 {
+			io.write_string(w, "</p>")
+			io.write_string(w, "<p>")
+			continue
+		}
+
+		// Lists
+		if trimmed_line[0] == '-' || trimmed_line[0] == '*' {
+			io.write_string(w, "<ul>")
+			for len(trimmed_line) > 0 && (trimmed_line[0] == '-' || trimmed_line[0] == '*') {
+				io.write_string(w, "<li>")
+				trimmed_line_to_write := trimmed_line[1:]
+				write_markup_single_line(w, &trimmed_line_to_write)
+				io.write_string(w, "</li>")
+				
+				i += 1;
+				if i >= len(lines) {
+					break line_loop
+				}
+				
+				line = lines[i]
+				trimmed_line = strings.trim_space(line)
+			}
+			io.write_string(w, "</ul>")
+			continue
+		}
+
+		// Multi-line code block
+		triple_backtick_index := strings.index(line, "```")
+		if triple_backtick_index >= 0 {
+			// If we have a heading for this block of code, write it as a collapsible block
+			line_start_section := line[:triple_backtick_index]
+			if line_start_section != "" {
+				io.write_string(w, "<details open class=\"code-example\">")
+				io.write_string(w, "<summary>")
+				write_markup_single_line(w, &line_start_section)
+				io.write_string(w, "</summary>")
+			}
+
+			defer if line_start_section != "" {
+				io.write_string(w, "</details>")
+			}
+			
+			// Writes the code
+			line = line[triple_backtick_index + 3:]
+			fmt.wprintf(w, "<pre><code class=\"%s\">", line if line != "" else "odin")
+			defer io.write_string(w, "</code></pre>")
+
+			for {
+				i += 1
+				if i >= len(lines) {
+					break line_loop
+				}
+
+				line = lines[i]
+				triple_backtick_index = strings.index(line, "```")
+				if triple_backtick_index < 0 {
+					io.write_string(w, line)
+					io.write_string(w, "\n")
+				} else {
+					io.write_string(w, line[:triple_backtick_index])
+					line = line[triple_backtick_index + 3:]
+					break
+				}
+			}
+		}
+
+		write_markup_single_line(w, &line)
+	}
+
+	io.write_string(w, "</p>\n")
+	io.write_string(w, "</span>\n")
 }
 
 write_docs :: proc(w: io.Writer, docs: string) {
 	if docs == "" {
 		return
 	}
-	Block_Kind :: enum {
-		Paragraph,
-		Code,
-	}
-	Block :: struct {
-		kind: Block_Kind,
-		lines: []string,
-	}
 
-	lines: [dynamic]string
 	it := docs
+	lines: [dynamic]string
 	for line_ in strings.split_iterator(&it, "\n") {
 		line := strings.trim_right_space(line_)
 		append(&lines, line)
 	}
-
-	curr_block_kind := Block_Kind.Paragraph
-	start := 0
-	blocks: [dynamic]Block
-
-	for line, i in lines {
-		text := strings.trim_space(line)
-		switch curr_block_kind {
-		case .Paragraph:
-			if strings.has_prefix(line, "\t") {
-				if i-start > 0 {
-					append(&blocks, Block{curr_block_kind, lines[start:i]})
-				}
-				curr_block_kind, start = .Code, i
-			} else if text == "" {
-				if i-start > 0 {
-					append(&blocks, Block{curr_block_kind, lines[start:i]})
-				}
-				start = i
-			}
-		case .Code:
-			if text == "" || strings.has_prefix(line, "\t") {
-				continue
-			}
-
-			if i-start > 0 {
-				append(&blocks, Block{curr_block_kind, lines[start:i]})
-			}
-			curr_block_kind, start = .Paragraph, i
-		}
-	}
-	if start < len(lines) {
-		if len(lines)-start > 0 {
-			append(&blocks, Block{curr_block_kind, lines[start:]})
-		}
-	}
-
-	for block in &blocks {
-		trim_amount := 0
-		for trim_amount = 0; trim_amount < len(block.lines); trim_amount += 1 {
-			line := block.lines[trim_amount]
-			if strings.trim_space(line) != "" {
-				break
-			}
-		}
-		block.lines = block.lines[trim_amount:]
-	}
-
-	for block, i in blocks {
-		if len(block.lines) == 0 {
-			continue
-		}
-		prev_line := ""
-		if i > 0 {
-			prev_lines := blocks[i-1].lines
-			if len(prev_lines) > 0 {
-				prev_line = prev_lines[len(prev_lines)-1]
-			}
-		}
-		prev_line = strings.trim_space(prev_line)
-
-		lines := block.lines[:]
-
-		end_line := block.lines[len(lines)-1]
-		if block.kind == .Paragraph && i+1 < len(blocks) {
-			if strings.has_prefix(end_line, "Example:") && blocks[i+1].kind == .Code {
-				lines = lines[:len(lines)-1]
-			}
-		}
-
-		switch block.kind {
-		case .Paragraph:
-			io.write_string(w, "<p>")
-			for line, line_idx in lines {
-				if line_idx > 0 {
-					io.write_string(w, "\n")
-				}
-				write_markup_text(w, line)
-			}
-			io.write_string(w, "</p>\n")
-		case .Code:
-			all_blank := len(lines) > 0
-			for line in lines {
-				if strings.trim_space(line) != "" {
-					all_blank = false
-				}
-			}
-			if all_blank {
-				continue
-			}
-
-			if strings.has_prefix(prev_line, "Example:") {
-				io.write_string(w, "<details open class=\"code-example\">\n")
-				defer io.write_string(w, "</details>\n")
-				io.write_string(w, "<summary>Example:</summary>\n")
-				io.write_string(w, `<pre><code class="hljs" data-lang="odin">`)
-				for line in lines {
-					io.write_string(w, strings.trim_prefix(line, "\t"))
-					io.write_string(w, "\n")
-				}
-				io.write_string(w, "</code></pre>\n")
-			} else {
-				io.write_string(w, "<pre>")
-				for line in lines {
-					io.write_string(w, strings.trim_prefix(line, "\t"))
-					io.write_string(w, "\n")
-				}
-				io.write_string(w, "</pre>\n")
-			}
-		}
-	}
+	
+	write_markup_text(w, lines[:])
 }
 
 write_pkg_sidebar :: proc(w: io.Writer, curr_pkg: ^doc.Pkg, collection: ^Collection) {
@@ -1328,7 +1297,7 @@ write_pkg :: proc(w: io.Writer, path: string, pkg: ^doc.Pkg, collection: ^Collec
 		fmt.wprintln(w, "<div id=\"pkg-overview\">")
 		defer fmt.wprintln(w, "</div>")
 
-		write_docs(w, overview_docs)
+		write_docs(w, str(pkg.docs)) // We want the untrimmed version, it will be trimmed when parsed for markup
 	}
 
 	fmt.wprintln(w, `<div id="pkg-index">`)
@@ -1596,7 +1565,7 @@ write_pkg :: proc(w: io.Writer, path: string, pkg: ^doc.Pkg, collection: ^Collec
 		if the_docs != "" {
 			fmt.wprintln(w, `<details class="odin-doc-toggle" open>`)
 			fmt.wprintln(w, `<summary class="hideme"><span>&nbsp;</span></summary>`)
-			write_docs(w, the_docs)
+			write_docs(w, str(e.docs)) // We want the untrimmed version, it will be trimmed when parsed for markup
 			fmt.wprintln(w, `</details>`)
 		}
 	}
